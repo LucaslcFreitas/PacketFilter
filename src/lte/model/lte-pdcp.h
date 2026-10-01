@@ -16,6 +16,8 @@
 #include "ns3/trace-source-accessor.h"
 #include "ns3/traced-value.h"
 
+#include <string>
+
 namespace ns3
 {
 
@@ -38,6 +40,19 @@ class LtePdcp : public Object // SimpleRefCount<LtePdcp>
      */
     static TypeId GetTypeId();
     void DoDispose() override;
+
+    /**
+     * Configure the optional external xApp used to inspect PDCP SDUs.
+     *
+     * @param address IPv4 address of the xApp TCP server.
+     * @param port TCP port of the xApp TCP server.
+     */
+    static void SetXAppSocket(const std::string& address, uint16_t port);
+
+    /**
+     * Disable external xApp inspection and close its connection.
+     */
+    static void DisableXAppSocket();
 
     /**
      *
@@ -147,6 +162,18 @@ class LtePdcp : public Object // SimpleRefCount<LtePdcp>
      * @param p packet
      */
     virtual void DoReceivePdu(Ptr<Packet> p);
+
+    /**
+     * Ask the external xApp whether a PDCP SDU should be delivered.
+     *
+     * @param packet PDCP SDU to inspect.
+     * @param direction Direction label included in the xApp message.
+     * @return true when the packet should be delivered.
+     */
+    static bool QueryXApp(Ptr<Packet> packet,
+                const std::string& direction,
+                uint16_t rnti,
+                uint8_t lcid);
 
     LteRlcSapUser* m_rlcSapUser;         ///< RLC SAP user
     LteRlcSapProvider* m_rlcSapProvider; ///< RLC SAP provider

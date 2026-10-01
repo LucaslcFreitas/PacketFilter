@@ -15,6 +15,16 @@
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstring>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <sstream>
+#include <vector>
+
 namespace ns3
 {
 
@@ -58,6 +68,76 @@ LtePdcpSpecificLteRlcSapUser::ReceivePdcpPdu(Ptr<Packet> p)
 
 NS_OBJECT_ENSURE_REGISTERED(LtePdcp);
 
+namespace
+{
+bool g_xappEnabled = false;
+std::string g_xappAddress;
+uint16_t g_xappPort = 0;
+int g_xappSocket = -1;
+
+void
+CloseXAppSocket()
+{
+    if (g_xappSocket >= 0)
+    {
+        close(g_xappSocket);
+        g_xappSocket = -1;
+    }
+}
+
+bool
+ConnectXAppSocket()
+{
+    if (g_xappSocket >= 0)
+    {
+        return true;
+    }
+
+    g_xappSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_xappSocket < 0)
+    {
+        return false;
+    }
+
+    timeval timeout{};
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 100000;
+    setsockopt(g_xappSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    setsockopt(g_xappSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    sockaddr_in server{};
+    server.sin_family = AF_INET;
+    server.sin_port = htons(g_xappPort);
+    if (inet_pton(AF_INET, g_xappAddress.c_str(), &server.sin_addr) != 1 ||
+        connect(g_xappSocket, reinterpret_cast<sockaddr*>(&server), sizeof(server)) < 0)
+    {
+        CloseXAppSocket();
+        return false;
+    }
+    return true;
+}
+
+std::string
+PacketToHex(Ptr<Packet> packet)
+{
+    std::vector<uint8_t> bytes(packet->GetSize());
+    if (!bytes.empty())
+    {
+        packet->CopyData(bytes.data(), bytes.size());
+    }
+
+    static const char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(bytes.size() * 2);
+    for (uint8_t byte : bytes)
+    {
+        result.push_back(hex[byte >> 4]);
+        result.push_back(hex[byte & 0x0f]);
+    }
+    return result;
+}
+} // namespace
+
 LtePdcp::LtePdcp()
     : m_pdcpSapUser(nullptr),
       m_rlcSapProvider(nullptr),
@@ -99,6 +179,59 @@ LtePdcp::DoDispose()
     NS_LOG_FUNCTION(this);
     delete (m_pdcpSapProvider);
     delete (m_rlcSapUser);
+}
+
+void
+LtePdcp::SetXAppSocket(const std::string& address, uint16_t port)
+{
+    CloseXAppSocket();
+    g_xappAddress = address;
+    g_xappPort = port;
+    g_xappEnabled = true;
+}
+
+void
+LtePdcp::DisableXAppSocket()
+{
+    g_xappEnabled = false;
+    CloseXAppSocket();
+}
+
+bool
+LtePdcp::QueryXApp(Ptr<Packet> packet,
+                   const std::string& direction,
+                   uint16_t rnti,
+                   uint8_t lcid)
+{
+    if (!g_xappEnabled || !ConnectXAppSocket())
+    {
+        return true;
+    }
+
+    std::ostringstream message;
+    message << "{\"time_ns\":" << Simulator::Now().GetNanoSeconds()
+            << ",\"direction\":\"" << direction << "\",\"rnti\":" << rnti
+            << ",\"lcid\":" << static_cast<uint32_t>(lcid)
+            << ",\"size\":" << packet->GetSize() << ",\"payload_hex\":\""
+            << PacketToHex(packet) << "\"}\n";
+    const std::string serialized = message.str();
+
+    if (send(g_xappSocket, serialized.data(), serialized.size(), 0) < 0)
+    {
+        CloseXAppSocket();
+        return true;
+    }
+
+    char response[256]{};
+    const ssize_t received = recv(g_xappSocket, response, sizeof(response) - 1, 0);
+    if (received <= 0)
+    {
+        CloseXAppSocket();
+        return true;
+    }
+
+    response[received] = '\0';
+    return std::string(response).find("\"action\":\"drop\"") == std::string::npos;
 }
 
 void
@@ -167,6 +300,12 @@ LtePdcp::DoTransmitPdcpSdu(LtePdcpSapProvider::TransmitPdcpSduParameters params)
     NS_LOG_FUNCTION(this << m_rnti << static_cast<uint16_t>(m_lcid) << params.pdcpSdu->GetSize());
     Ptr<Packet> p = params.pdcpSdu;
 
+    if (!QueryXApp(p, "uplink", m_rnti, m_lcid))
+    {
+        NS_LOG_INFO("External xApp dropped PDCP SDU");
+        return;
+    }
+
     // Sender timestamp
     PdcpTag pdcpTag(Simulator::Now());
 
@@ -198,6 +337,15 @@ void
 LtePdcp::DoReceivePdu(Ptr<Packet> p)
 {
     NS_LOG_FUNCTION(this << m_rnti << (uint32_t)m_lcid << p->GetSize());
+
+    Ptr<Packet> inspected = p->Copy();
+    LtePdcpHeader inspectedHeader;
+    inspected->RemoveHeader(inspectedHeader);
+    if (!QueryXApp(inspected, "downlink", m_rnti, m_lcid))
+    {
+        NS_LOG_INFO("External xApp dropped PDCP SDU");
+        return;
+    }
 
     // Receiver timestamp
     PdcpTag pdcpTag;
